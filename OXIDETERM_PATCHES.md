@@ -1,6 +1,6 @@
-# OxideTerm russh Vendor Patches
+# OxideTerm russh Fork Patches
 
-This directory is a vendored russh fork, not a plain crates.io copy. Before
+This repository maintains the russh fork previously vendored by OxideTerm. Before
 upgrading it, compare the current tree against the exact upstream russh release
 and preserve every OxideTerm-specific compatibility, transfer, and
 secret-handling patch listed below.
@@ -50,9 +50,9 @@ current contract exists.
 Commit `3bbfb4baf` contains only mechanical clone cleanups in the final vendor
 diff. It is not a patch contract and should not be replayed during an upgrade.
 
-## Why russh Is Vendored
+## Why OxideTerm Maintains This Fork
 
-OxideTerm vendors russh for several independently required behaviors:
+OxideTerm uses this fork for several independently required behaviors:
 
 - correct RSA SHA-2 certificate authentication on strict OpenSSH servers;
 - broader modern and opt-in legacy algorithm negotiation;
@@ -254,14 +254,20 @@ an upstream rebase instead of preserving them as mandatory patches.
 
 ## Verification
 
-After changing this vendor fork, run the local russh and OxideTerm integration
-coverage first:
+After changing this fork, run the relevant russh tests here:
 
 ```sh
-cargo fmt --all --check
 cargo test -p russh
 cargo test -p russh x11_cookie_debug_is_redacted
 cargo test -p russh --test test_sntrup_kex
+git diff --check
+```
+
+Then update OxideTerm's pinned Git revision and run integration coverage in the
+OxideTerm checkout:
+
+```sh
+cargo tree -i russh
 cargo test -p oxideterm-ssh
 cargo test -p oxideterm-sftp
 cargo test -p oxideterm-forwarding

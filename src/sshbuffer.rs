@@ -463,7 +463,9 @@ impl PacketWriter {
                 Ok(())
             }
             Err(err) => {
-                self.write_buffer.buffer[offset..].zeroize();
+                if let Some(payload) = self.write_buffer.buffer.get_mut(offset..) {
+                    payload.zeroize();
+                }
                 self.write_buffer.buffer.truncate(offset);
                 Err(err)
             }
@@ -490,7 +492,9 @@ impl PacketWriter {
                 Ok(())
             }
             Err(err) => {
-                self.write_buffer.buffer[offset..].zeroize();
+                if let Some(payload) = self.write_buffer.buffer.get_mut(offset..) {
+                    payload.zeroize();
+                }
                 self.write_buffer.buffer.truncate(offset);
                 Err(err)
             }

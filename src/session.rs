@@ -705,7 +705,7 @@ impl Encrypted {
                     // this queue; wipe later queued secrets before returning.
                     self.write_cursor = 0;
                     self.write.zeroize();
-                    return Err(error.into());
+                    return Err(error);
                 }
                 self.write_cursor += 4 + len
             }
