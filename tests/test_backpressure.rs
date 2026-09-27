@@ -36,6 +36,13 @@ async fn test_backpressure() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 async fn server_handle_data_backpressures_when_client_stops_reading() -> Result<(), anyhow::Error> {
+    for drop_reader in [false, true] {
+        read_after_pressure(drop_reader).await?;
+    }
+    Ok(())
+}
+
+async fn read_after_pressure(drop_reader: bool) -> Result<(), anyhow::Error> {
     let addr = addr();
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
 
@@ -48,10 +55,19 @@ async fn server_handle_data_backpressures_when_client_stops_reading() -> Result<
     let config = Arc::new(client::Config {
         window_size: WINDOW_SIZE as u32,
         channel_buffer_size: 1,
+        maximum_packet_size: 1024,
         ..Default::default()
     });
     let key = Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
-    let mut session = russh::client::connect(config, addr, Client).await?;
+    let (output, mut output_rx) = mpsc::unbounded_channel();
+    let mut session = russh::client::connect(
+        config,
+        addr,
+        Client {
+            output: Some(output),
+        },
+    )
+    .await?;
     let mut channel = match session
         .authenticate_publickey(
             "user",
@@ -73,13 +89,33 @@ async fn server_handle_data_backpressures_when_client_stops_reading() -> Result<
     while progress_rx.try_recv().is_ok() {
         accepted += 1;
     }
-    assert!(accepted < HANDLE_DATA_COUNT);
+    assert!(accepted > 0 && accepted < HANDLE_DATA_COUNT);
 
+    let expected: Vec<u8> = (0..HANDLE_DATA_COUNT)
+        .flat_map(|index| std::iter::repeat_n(index as u8, WINDOW_SIZE))
+        .collect();
+    if drop_reader {
+        let (mut reader, _writer) = channel.split();
+        while !matches!(reader.wait().await, Some(ChannelMsg::Data { .. })) {}
+        // The handler becomes the sole consumer while unread packets still
+        // occupy both the channel mailbox and deferred delivery queue.
+        drop(reader);
+        let received = timeout(Duration::from_secs(5), async {
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                received.extend(output_rx.recv().await.expect("handler output"));
+            }
+            received
+        })
+        .await?;
+        assert_eq!(received, expected);
+        return Ok(());
+    }
     let received = timeout(Duration::from_secs(5), async {
-        let mut received = 0;
+        let mut received = Vec::new();
         while let Some(message) = channel.wait().await {
             match message {
-                ChannelMsg::Data { data } => received += data.len(),
+                ChannelMsg::Data { data } => received.extend_from_slice(&data),
                 ChannelMsg::Eof | ChannelMsg::Close => break,
                 ChannelMsg::WindowAdjusted { .. } => {}
                 other => panic!("unexpected message {other:?}"),
@@ -89,7 +125,7 @@ async fn server_handle_data_backpressures_when_client_stops_reading() -> Result<
     })
     .await?;
 
-    assert_eq!(received, HANDLE_DATA_COUNT * WINDOW_SIZE);
+    assert_eq!(received, expected);
     Ok(())
 }
 
@@ -97,7 +133,7 @@ async fn stream(addr: SocketAddr, data: &[u8], tx: watch::Sender<()>) -> Result<
     let config = Arc::new(client::Config::default());
     let key = Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
 
-    let mut session = russh::client::connect(config, addr, Client).await?;
+    let mut session = russh::client::connect(config, addr, Client::default()).await?;
     let channel = match session
         .authenticate_publickey(
             "user",
@@ -205,10 +241,25 @@ impl russh::server::Handler for Server {
     }
 }
 
-struct Client;
+#[derive(Default)]
+struct Client {
+    output: Option<mpsc::UnboundedSender<Vec<u8>>>,
+}
 
 impl russh::client::Handler for Client {
     type Error = anyhow::Error;
+
+    async fn data(
+        &mut self,
+        _: russh::ChannelId,
+        data: &[u8],
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(output) = &self.output {
+            let _ = output.send(data.to_vec());
+        }
+        Ok(())
+    }
 
     async fn check_server_key(&mut self, _: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         Ok(true)
@@ -263,7 +314,11 @@ impl russh::server::Handler for HandleBackpressureServer {
         reply.accept().await;
         tokio::spawn(async move {
             for index in 0..HANDLE_DATA_COUNT {
-                if handle.data(channel_id, vec![0; WINDOW_SIZE]).await.is_err() {
+                if handle
+                    .data(channel_id, vec![index as u8; WINDOW_SIZE])
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 let _ = progress_tx.send(index);
