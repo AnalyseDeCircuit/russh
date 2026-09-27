@@ -18,8 +18,8 @@ use std::fmt::{Debug, Formatter};
 use std::mem::replace;
 use std::num::Wrapping;
 
-use bytes::Bytes;
 use byteorder::{BigEndian, ByteOrder};
+use bytes::Bytes;
 use log::{debug, trace};
 use ssh_encoding::Encode;
 use tokio::sync::oneshot;
@@ -31,7 +31,7 @@ use crate::kex::dh::groups::DhGroup;
 use crate::kex::{KexAlgorithm, KexAlgorithmImplementor};
 use crate::sshbuffer::PacketWriter;
 use crate::{
-    ChannelId, ChannelParams, CryptoVec, Disconnect, Limits, auth, cipher, mac, msg, negotiation,
+    auth, cipher, mac, msg, negotiation, ChannelId, ChannelParams, CryptoVec, Disconnect, Limits,
 };
 
 #[derive(Debug)]
@@ -293,6 +293,41 @@ impl Encrypted {
         } else {
             0
         }
+    }
+
+    pub(crate) fn consume_window(
+        &mut self,
+        id: ChannelId,
+        length: usize,
+    ) -> Result<(), crate::Error> {
+        let length = u32::try_from(length).map_err(|_| crate::Error::Inconsistent)?;
+        // Packets already in flight can arrive after the local close removed this channel.
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.sender_window_size = channel
+                .sender_window_size
+                .checked_sub(length)
+                .ok_or(crate::Error::Inconsistent)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replenish_window(
+        &mut self,
+        id: ChannelId,
+        amount: u32,
+    ) -> Result<(), crate::Error> {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.sender_window_size = channel
+                .sender_window_size
+                .checked_add(amount)
+                .ok_or(crate::Error::Inconsistent)?;
+            push_packet!(self.write, {
+                self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+                channel.recipient_channel.encode(&mut self.write)?;
+                amount.encode(&mut self.write)?;
+            });
+        }
+        Ok(())
     }
 
     pub fn adjust_window_size(

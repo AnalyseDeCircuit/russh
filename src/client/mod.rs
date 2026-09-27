@@ -44,8 +44,8 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use futures::Future;
 use futures::task::{Context, Poll};
+use futures::Future;
 use kex::ClientKex;
 use log::{debug, error, trace, warn};
 use russh_util::time::Instant;
@@ -54,7 +54,7 @@ use ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::pin;
 use tokio::sync::mpsc::{
-    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
@@ -72,8 +72,8 @@ use crate::session::{CommonSession, EncryptedState, GlobalRequestResponse, NewKe
 use crate::ssh_read::SshRead;
 use crate::sshbuffer::{IncomingSshPacket, PacketWriter, SSHBuffer, SshId};
 use crate::{
-    ChannelId, ChannelOpenFailure, Disconnect, Error, Limits, MethodSet, Sig, auth, map_err, msg,
-    negotiation,
+    auth, map_err, msg, negotiation, ChannelId, ChannelOpenFailure, Disconnect, Error, Limits,
+    MethodSet, Sig,
 };
 
 mod encrypted;
@@ -199,6 +199,7 @@ impl fmt::Debug for Reply {
 
 #[allow(clippy::large_enum_variant)]
 pub enum Msg {
+    ChannelReadReady(ChannelId),
     Authenticate {
         user: String,
         method: auth::Method,
@@ -298,6 +299,7 @@ impl fmt::Debug for Msg {
         // Client messages can be dumped while diagnosing auth flows; redact
         // keyboard-interactive answers because they often contain passwords.
         match self {
+            Self::ChannelReadReady(id) => f.debug_tuple("ChannelReadReady").field(id).finish(),
             Self::Authenticate { user, method } => f
                 .debug_struct("Authenticate")
                 .field("user", user)
@@ -875,9 +877,12 @@ impl<H: Handler> Handle<H> {
         &self,
         mut receiver: Receiver<ChannelMsg>,
         window_size_ref: WindowSizeRef,
+        receive_state: Arc<crate::channels::ReceiveState>,
     ) -> Result<Channel<Msg>, crate::Error> {
         loop {
-            match receiver.recv().await {
+            let message = receiver.recv().await;
+            receive_state.read(message.as_ref());
+            match message {
                 Some(ChannelMsg::Open {
                     id,
                     max_packet_size,
@@ -892,7 +897,10 @@ impl<H: Handler> Handle<H> {
                             max_packet_size,
                             window_size: window_size_ref,
                         },
-                        read_half: ChannelReadHalf { receiver },
+                        read_half: ChannelReadHalf {
+                            receiver,
+                            receive_state,
+                        },
                     });
                 }
                 Some(ChannelMsg::OpenFailure(reason)) => {
@@ -978,12 +986,13 @@ impl<H: Handler> Handle<H> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let channel_ref = ChannelRef::new(sender);
         let window_size_ref = channel_ref.window_size().clone();
+        let receive_state = channel_ref.receive_state.clone();
 
         self.sender
             .send(Msg::ChannelOpenSession { channel_ref })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, receive_state)
             .await
     }
 
@@ -996,6 +1005,7 @@ impl<H: Handler> Handle<H> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let channel_ref = ChannelRef::new(sender);
         let window_size_ref = channel_ref.window_size().clone();
+        let receive_state = channel_ref.receive_state.clone();
 
         self.sender
             .send(Msg::ChannelOpenX11 {
@@ -1005,7 +1015,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, receive_state)
             .await
     }
 
@@ -1027,6 +1037,7 @@ impl<H: Handler> Handle<H> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let channel_ref = ChannelRef::new(sender);
         let window_size_ref = channel_ref.window_size().clone();
+        let receive_state = channel_ref.receive_state.clone();
 
         self.sender
             .send(Msg::ChannelOpenDirectTcpIp {
@@ -1038,7 +1049,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, receive_state)
             .await
     }
 
@@ -1049,6 +1060,7 @@ impl<H: Handler> Handle<H> {
         let (sender, receiver) = channel(self.channel_buffer_size);
         let channel_ref = ChannelRef::new(sender);
         let window_size_ref = channel_ref.window_size().clone();
+        let receive_state = channel_ref.receive_state.clone();
 
         self.sender
             .send(Msg::ChannelOpenDirectStreamLocal {
@@ -1057,7 +1069,7 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        self.wait_channel_confirmation(receiver, window_size_ref)
+        self.wait_channel_confirmation(receiver, window_size_ref, receive_state)
             .await
     }
 
@@ -1539,9 +1551,9 @@ impl Session {
                     return Err(crate::Error::InactivityTimeout.into());
                 }
                 msg = self.receiver.recv(), if can_receive_outbound => {
-                    self.drain_priority_msgs()?;
+                    self.drain_priority_msgs(handler)?;
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_msg(msg, handler)?,
                         None => {
                             self.common.disconnected = true;
                             break
@@ -1550,34 +1562,34 @@ impl Session {
 
                     // eagerly take all outgoing messages so writes are batched
                     while !self.kex.active() && !self.common.has_any_pending_data() {
-                        self.drain_priority_msgs()?;
+                        self.drain_priority_msgs(handler)?;
                         match self.receiver.try_recv() {
-                            Ok(next) => self.handle_msg(next)?,
+                            Ok(next) => self.handle_msg(next, handler)?,
                             Err(_) => break
                         }
                     }
                 }
                 msg = self.priority_receiver.recv(), if !self.kex.active() => {
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_msg(msg, handler)?,
                         None => (),
                     }
 
                     // eagerly take all outgoing messages so writes are batched
-                    self.drain_priority_msgs()?;
+                    self.drain_priority_msgs(handler)?;
                 }
                 msg = self.inbound_channel_receiver.recv(), if can_receive_outbound => {
-                    self.drain_priority_msgs()?;
+                    self.drain_priority_msgs(handler)?;
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_msg(msg, handler)?,
                         None => (),
                     }
 
                     // eagerly take all outgoing messages so writes are batched
                     while !self.kex.active() && !self.common.has_any_pending_data() {
-                        self.drain_priority_msgs()?;
+                        self.drain_priority_msgs(handler)?;
                         match self.inbound_channel_receiver.try_recv() {
-                            Ok(next) => self.handle_msg(next)?,
+                            Ok(next) => self.handle_msg(next, handler)?,
                             Err(_) => break
                         }
                     }
@@ -1650,18 +1662,78 @@ impl Session {
     /// whose confirmation is still sitting in the priority queue, and
     /// dispatching that data first would silently drop it (the channel is
     /// only registered when its open reply is processed).
-    fn drain_priority_msgs(&mut self) -> Result<(), crate::Error> {
+    fn drain_priority_msgs(&mut self, handler: &mut impl Handler) -> Result<(), crate::Error> {
         while !self.kex.active() {
             match self.priority_receiver.try_recv() {
-                Ok(msg) => self.handle_msg(msg)?,
+                Ok(msg) => self.handle_msg(msg, handler)?,
                 Err(_) => break,
             }
         }
         Ok(())
     }
 
-    fn handle_msg(&mut self, msg: Msg) -> Result<(), crate::Error> {
+    fn configure_channel_receiver(&self, id: ChannelId, channel: &ChannelRef) {
+        let sender = self.priority_sender.clone();
+        channel.enable_receive_flow(
+            self.common.config.maximum_packet_size as usize,
+            self.common.config.channel_buffer_size,
+            Arc::new(move || {
+                let _ = sender.send(Msg::ChannelReadReady(id));
+            }),
+        );
+    }
+
+    fn channel_read_ready(
+        &mut self,
+        id: ChannelId,
+        handler: &mut impl Handler,
+    ) -> Result<(), crate::Error> {
+        let Some(channel) = self.channels.get(&id) else {
+            return Ok(());
+        };
+        let consumed = channel.receive_state.take_consumed();
+        let (credit, remove) = {
+            let mut delivery = channel.delivery.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(delivery) = delivery.as_mut() else {
+                return Ok(());
+            };
+            delivery.flush(channel, &channel.receive_state);
+            delivery.reclaimed = delivery
+                .reclaimed
+                .checked_add(consumed)
+                .ok_or(crate::Error::Inconsistent)?;
+            let remaining = self
+                .common
+                .encrypted
+                .as_ref()
+                .and_then(|enc| enc.channels.get(&id))
+                .map_or(0, |channel| channel.sender_window_size);
+            let credit =
+                if delivery.reclaimed >= self.common.config.window_size / 2 || remaining == 0 {
+                    std::mem::take(&mut delivery.reclaimed)
+                } else {
+                    0
+                };
+            (credit, delivery.closing && delivery.is_empty())
+        };
+        if credit > 0 {
+            if let Some(enc) = &mut self.common.encrypted {
+                enc.replenish_window(id, credit)?;
+            }
+            let next_window = handler.adjust_window(id, self.target_window_size);
+            if next_window > 0 {
+                self.target_window_size = next_window;
+            }
+        }
+        if remove {
+            self.channels.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn handle_msg(&mut self, msg: Msg, handler: &mut impl Handler) -> Result<(), crate::Error> {
         match msg {
+            Msg::ChannelReadReady(id) => self.channel_read_ready(id, handler)?,
             Msg::Authenticate { user, method } => {
                 self.write_auth_request_if_needed(&user, method)?;
             }
@@ -1689,6 +1761,7 @@ impl Session {
             }
             Msg::ChannelOpenSession { channel_ref } => {
                 let id = self.channel_open_session()?;
+                self.configure_channel_receiver(id, &channel_ref);
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenX11 {
@@ -1697,6 +1770,7 @@ impl Session {
                 channel_ref,
             } => {
                 let id = self.channel_open_x11(&originator_address, originator_port)?;
+                self.configure_channel_receiver(id, &channel_ref);
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenDirectTcpIp {
@@ -1712,6 +1786,7 @@ impl Session {
                     &originator_address,
                     originator_port,
                 )?;
+                self.configure_channel_receiver(id, &channel_ref);
                 self.channels.insert(id, channel_ref);
             }
             Msg::ChannelOpenDirectStreamLocal {
@@ -1719,6 +1794,7 @@ impl Session {
                 channel_ref,
             } => {
                 let id = self.channel_open_direct_streamlocal(&socket_path)?;
+                self.configure_channel_receiver(id, &channel_ref);
                 self.channels.insert(id, channel_ref);
             }
             Msg::TcpIpForward {

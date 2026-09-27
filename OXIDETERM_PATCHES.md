@@ -252,6 +252,40 @@ Mechanical cleanups such as replacing `cloned()` with `copied()` or removing
 unnecessary clones are not vendor contracts. Re-evaluate those normally during
 an upstream rebase instead of preserving them as mandatory patches.
 
+## Client Receive Flow Control (2026-09-27)
+
+- `src/channels/receive.rs`, `channel_ref.rs`, `mod.rs`, and `io/rx.rs`
+  defer delivery without awaiting a full channel mailbox. Unread data remains
+  bounded by that channel's advertised receive window; control-message backlog
+  has a separate channel-buffer bound. Adjacent data of the same type can be
+  coalesced up to the configured packet size. Preserve data/control ordering.
+- `src/client/encrypted.rs` debits the window on receipt without replenishing it
+  immediately. The read half returns credit after handing data to the consumer.
+  One stream-reader packet may remain in its existing partial-read buffer.
+- `src/client/mod.rs` coalesces read notifications on the priority queue, flushes
+  deferred delivery and emits window adjustments. Keep EOF/close behind prior
+  data. A dropped read half returns unread credit so Handler-only consumers can
+  continue. Preserve the existing adjust-window callback when credit is sent.
+- `src/session.rs` checks consumed/replenished window arithmetic. In-flight
+  packets for an already retired local channel must not terminate the transport.
+  Server receive behavior is unchanged; its read halves have no client credit hook.
+- The deferred queue wipes owned plaintext when discarded. No payload-bearing
+  debug output is introduced. The application still owns its parser buffers and
+  must stop consuming when recording capacity is exhausted.
+
+Validation: existing backpressure, data-stream and maximum-packet integration
+suites pass (six tests). The backpressure case now checks exact bytes both after
+resuming reads and after dropping the read half. OxideTerm's real SSH fixture
+also verifies forwarding and macOS OpenSSH SFTP reads on the same connection
+while a terminal is paused, plus recording resume/input/cancel. This addresses
+client receive pressure; arbitrary blocking Handler callbacks and outbound
+channel pressure are outside this patch's claim.
+
+Before publication, OxideTerm validation used a command-line path override to
+this fork. Consumers must pin the commit containing this patch and verify the
+resolved Git dependency after updating their lockfile. No throughput benchmark
+was run for this patch.
+
 ## Verification
 
 After changing this fork, run the relevant russh tests here:
