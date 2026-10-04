@@ -178,6 +178,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn incompressible_channel_packet_is_fully_flushed() {
+        let mut payload = vec![94, 0, 0, 0, 2, 0, 0, 128, 0];
+        let mut random = 0x1234_5678u32;
+        for _ in 0..32768 {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            payload.push(random as u8);
+        }
+        for in_place in [false, true] {
+            let mut compressor = Compress::None;
+            Compression::Zlib.init_compress(&mut compressor);
+            let mut decoder = flate2::Decompress::new(true);
+            for packet in [b"first packet".as_slice(), payload.as_slice(), b"last packet"] {
+                let mut encoded = Vec::new();
+                if in_place {
+                    let prefix = b"queued-packet";
+                    encoded.extend_from_slice(prefix);
+                    compressor
+                        .compress_into(packet, &mut encoded, prefix.len())
+                        .unwrap();
+                    assert_eq!(&encoded[..prefix.len()], prefix);
+                    encoded.drain(..prefix.len());
+                } else {
+                    let bytes = compressor.compress(packet, &mut encoded).unwrap().to_vec();
+                    encoded = bytes;
+                }
+                let before = decoder.total_out();
+                let mut decoded = vec![0; packet.len() + 1024];
+                decoder
+                    .decompress(&encoded, &mut decoded, flate2::FlushDecompress::None)
+                    .unwrap();
+                let written = (decoder.total_out() - before) as usize;
+                assert_eq!(written, packet.len(), "in_place={in_place}");
+                assert_eq!(&decoded[..written], packet, "in_place={in_place}");
+            }
+        }
+    }
+
+    #[test]
     fn decompressed_packet_at_limit_is_accepted() {
         let payload = vec![b'A'; MAXIMUM_DECOMPRESSED_PACKET_LEN];
         let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
@@ -261,13 +301,15 @@ impl Compress {
                     let n_in_ = z.total_in() as usize - n_in;
                     let n_out_ = z.total_out() as usize - n_out;
                     #[allow(clippy::indexing_slicing)] // length checked
-                    let c = z.compress(&input[n_in_..], &mut output[n_out_..], flush)?;
-                    match c {
-                        flate2::Status::BufError => {
-                            output.resize(output.len() * 2, 0);
-                        }
-                        _ => break,
+                    z.compress(&input[n_in_..], &mut output[n_out_..], flush)?;
+                    // Status::Ok can still fill the buffer before the packet's
+                    // partial flush is complete. SSH frames must contain the entire flush.
+                    if z.total_in() as usize - n_in == input.len()
+                        && z.total_out() as usize - n_out < output.len()
+                    {
+                        break;
                     }
+                    output.resize(output.len() * 2, 0);
                 }
                 let n_out_ = z.total_out() as usize - n_out;
                 #[allow(clippy::indexing_slicing)] // length checked
@@ -299,14 +341,15 @@ impl Compress {
                     let n_in_ = z.total_in() as usize - n_in;
                     let n_out_ = z.total_out() as usize - n_out;
                     #[allow(clippy::indexing_slicing)] // length checked
-                    let c = z.compress(&input[n_in_..], &mut output[start_len + n_out_..], flush)?;
-                    match c {
-                        flate2::Status::BufError => {
-                            let growth = output.len().saturating_sub(start_len).max(1);
-                            output.resize(output.len() + growth, 0);
-                        }
-                        _ => break,
+                    z.compress(&input[n_in_..], &mut output[start_len + n_out_..], flush)?;
+                    // Keep queued packets intact while finishing this packet's flush.
+                    if z.total_in() as usize - n_in == input.len()
+                        && z.total_out() as usize - n_out < output.len() - start_len
+                    {
+                        break;
                     }
+                    let growth = output.len().saturating_sub(start_len).max(1);
+                    output.resize(output.len() + growth, 0);
                 }
                 let n_out_ = z.total_out() as usize - n_out;
                 output.truncate(start_len + n_out_);
