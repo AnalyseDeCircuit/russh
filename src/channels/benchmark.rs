@@ -45,7 +45,7 @@ impl TransportHarness {
             }
             message => panic!("unexpected benchmark message: {message:?}"),
         }
-        self.window_size.update(SSH_MAX_PACKET_BYTES).await;
+        self.window_size.grow(self.frame.len() as u32).await;
     }
 
     async fn send_current(&mut self) {

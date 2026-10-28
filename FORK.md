@@ -2,8 +2,8 @@
 
 This repository contains the SSH library used by
 [OxideTerm](https://github.com/AnalyseDeCircuit/oxideterm). It is based on
-[upstream russh](https://github.com/warp-tech/russh) 0.63.0 at commit
-`dbe2234491fcd50e0bf68438452932f918092fe0`.
+[upstream russh](https://github.com/warp-tech/russh) 0.65.0 at commit
+`183a22e8f8f490fa09b6eb7bd044ef99d8c4414f` (Rust 1.89 or newer).
 
 The history was extracted from OxideTerm's `crates/russh` directory. Existing
 protocol, compatibility, transfer and secret-handling patches are retained;

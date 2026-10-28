@@ -7,10 +7,9 @@ secret-handling patch listed below.
 
 ## Exact Upstream Baseline
 
-The current fork is based on russh `0.63.0`, upstream commit
-`dbe2234491fcd50e0bf68438452932f918092fe0`. The same commit is recorded in
-`.cargo_vcs_info.json`. The imported crates.io archive has SHA-256
-`00cf00190c315093734a8d405225bd8773a219bc86538a9b73bfc51145b33995`.
+The current fork is based on russh `0.65.0`, upstream commit
+`183a22e8f8f490fa09b6eb7bd044ef99d8c4414f`. The same commit is recorded in
+`.cargo_vcs_info.json`. The baseline is the published crates.io 0.65.0 package.
 
 Do not use a nearby tag, crates.io archive, or current upstream `main` as the
 comparison base. Before upgrading, diff this directory against that exact
@@ -18,9 +17,10 @@ commit, then classify each remaining difference using the sections below.
 
 ## Audited Diff Snapshot
 
-This inventory was verified on 2026-08-21 against the crates.io 0.63.0 package
-and its recorded upstream commit. The rebased tree differs in 26 tracked paths:
-19 modified paths and 7 added paths. Every path is classified below.
+The 2026-10-28 upgrade compares the fork at
+`df41ee42819999db363e67309bbde0955a43e693` with the exact 0.63.0 and 0.65.0
+packages. It retains the receive-flow-control and complete-compression-flush
+fixes added after the original 0.63.0 inventory.
 
 The previous fork was independently audited before the rebase against both
 authoritative forms of the 0.61.2 baseline:
@@ -93,8 +93,10 @@ Keep these patches when updating russh:
 ### RSA SHA-2 Certificates
 
 - `src/client/encrypted.rs`
-  - Use `certificate_algorithm_name(cert, hash_alg)` for RSA certificate probes
-    and signed requests.
+  - Use upstream 0.65.0's
+    `cert.algorithm().with_hash_alg(hash_alg).to_certificate_type()` for external
+    RSA certificate probes and signed requests. This replaces the fork helper
+    and also works with the pinned `ssh-key` release candidate.
   - Pass the certificate `HashAlg` into `client_make_to_sign`.
   - Preserve the custom signer contract: certificate signers return the original
     `to_sign` buffer with an appended length-prefixed signature blob.
@@ -151,8 +153,8 @@ Keep these patches when updating russh:
     waiter before releasing the window lock prevents a lost adjustment wakeup.
   - Do not overlap the owned send path with a pending borrowed `AsyncWrite`
     send on the same channel.
-  - Build on the 0.63.0 channel notification and backpressure behavior rather
-    than restoring the 0.61.2 file wholesale.
+  - Build on 0.65.0's additive `WindowSizeRef::grow(amount)` updates rather than
+    resetting the remaining window; owned writers reserve credit concurrently.
 - `src/channels/mod.rs`, `src/lib_inner.rs`, `src/channels/benchmark.rs`, and
   `benches/sftp_transport.rs`
   - Keep the public owned-half exports, zero-copy slice regression tests, and
@@ -167,7 +169,9 @@ Keep these patches when updating russh:
     `p256`, `p384`, `p521`, and `ssh-key` until IronRDP moves to a compatible
     family. Do not add further overrides without a resolver error.
   - Keep workspace `ssh-encoding` on the stable 0.3 release required by russh
-    0.63.0 and `russh-cryptovec` 0.62.0.
+    0.65.0 and `russh-cryptovec` 0.62.0.
+  - Use upstream `num-bigint` 0.5 instead of `internal-russh-num-bigint`.
+    Require Pageant 0.2.4 or newer; both lockfiles select 0.2.5.
 
 ### Secret Handling
 
@@ -207,9 +211,9 @@ Keep these patches when updating russh:
   - Keep `X11AuthenticationCookie` zeroizing and redacted while preserving the
     existing public `request_x11` call shape through `AsRef<str>`.
 
-## Complete 0.63.0 File Inventory
+## Current Fork File Inventory
 
-These paths are the complete tracked behavior diff against the official 0.63.0
+These paths classify the tracked behavior diff against the official 0.65.0
 crate:
 
 | Paths | Vendor behavior |
@@ -217,22 +221,42 @@ crate:
 | `Cargo.lock`, `Cargo.toml`, `Cargo.toml.orig` | RustCrypto compatibility versions, pure-Rust `sntrup`, sntrup integration coverage, and the SFTP transport benchmark. |
 | `examples/sftp_server.rs` | Stops the example from logging accepted passwords. |
 | `src/auth.rs` | Zeroizes passwords and GSSAPI values and redacts auth diagnostics. |
-| `src/client/mod.rs`, `src/client/encrypted.rs` | Zeroizes queued keyboard-interactive and GSSAPI data, redacts internal replies/messages, and preserves RSA SHA-2 user-certificate encoding. |
+| `src/client/mod.rs`, `src/client/encrypted.rs` | Zeroizes queued keyboard-interactive and GSSAPI data, redacts internal replies/messages (including new global-request payloads), and integrates client receive flow control. RSA SHA-2 certificate encoding now uses the upstream implementation. |
 | `src/kex/dh/groups.rs`, `src/kex/dh/mod.rs` | Redacts DH private state and zeroizes encoded shared-secret material. |
 | `src/kex/hybrid_sntrup761.rs`, `src/kex/mod.rs`, `tests/test_sntrup_kex.rs` | Implements both OpenSSH sntrup names with clamped X25519, low-order rejection, handshake tests, and malformed-input coverage. |
 | `src/negotiation.rs` | Adds sntrup, NIST ECDH fallbacks, AES-128-GCM, and the separate legacy profile; updates the upstream unknown-KEX fixture now that sntrup is implemented. |
 | `src/keys/mod.rs` | Zeroizes private-key file contents after parsing. |
-| `src/channels/channel_stream.rs`, `src/channels/io/tx.rs`, `src/channels/mod.rs`, `src/lib_inner.rs` | Adds owned stream halves and an owned `Bytes` send path on top of 0.63.0 channel backpressure. These paths also own the redacted X11 cookie wrapper. |
+| `src/channels/channel_stream.rs`, `src/channels/io/tx.rs`, `src/channels/mod.rs`, `src/lib_inner.rs` | Adds owned stream halves and an owned `Bytes` send path on top of 0.65.0 channel backpressure. These paths also own the redacted X11 cookie wrapper. |
+| `src/channels/receive.rs`, `src/channels/channel_ref.rs`, `src/channels/io/rx.rs`, `src/server/session.rs`, `tests/test_backpressure.rs` | Bounded deferred client delivery, consumer-driven credit, close ordering, and server-side initialization without client credit hooks. |
 | `src/channels/benchmark.rs`, `benches/sftp_transport.rs` | Measures borrowed writes against the owned SFTP transport path. |
 | `src/server/encrypted.rs` | Keeps decoded X11 cookies zeroizing while passing them to the handler. |
 | `src/session.rs`, `src/sshbuffer.rs` | Redacts and wipes outgoing plaintext packet queues, compressed packet scratch, failure paths, and drop paths. |
+| `src/compression.rs` | Completes the partial flush after consuming all input, retaining a pre-existing output prefix. |
+| `tests/auth_signer_failure.rs`, `tests/test_window_adjust.rs` | Corrects the published tests' stale public-key handler signatures to `VerifiedPublicKey`. |
 
 The other tracked additions are not protocol patches:
 
 - `.cargo-ok` and `LICENSE-APACHE` are package/vendor metadata;
-- `OXIDETERM_PATCHES.md` is this audit document.
+- `OXIDETERM_PATCHES.md`, `FORK.md`, and `README.md` describe this fork;
+- `.gitignore` excludes local build output;
+- `.cargo_vcs_info.json` records the upstream commit with local formatting.
 
-No mechanical 0.61.2 source cleanup remains in the 0.63.0 behavior diff.
+Small existing clone cleanups in `src/client/kex.rs`, `src/server/kex.rs`, and
+`src/parsing.rs` remain; they do not change protocol behavior.
+
+## 0.65.0 Upgrade
+
+The upstream release now supplies the external RSA certificate algorithm fix,
+signer-failure recovery, partial-authentication results, pre-auth keepalive
+rearming, bounded EXT_INFO handling, additive send-window credit, packet-size
+validation, and rekey staging/timers. These implementations are retained rather
+than replaced with the old fork files. The fork's secret owners remain
+`Zeroizing` containers, including when authentication is abandoned or succeeds.
+
+The server authentication callback now takes `VerifiedPublicKey`; examples and
+test servers are migrated. Removed upstream features `async-trait` and
+`legacy-ed25519-pkcs8-parser` are not used by OxideTerm. The application toolchain
+exceeds the new Rust 1.89 minimum.
 
 ## 0.63.0 Rebase Result
 
@@ -288,6 +312,41 @@ was run for this patch.
 
 ## Verification
 
+### 0.65.0 validation (2026-10-28, macOS ARM64)
+
+- `cargo test --locked --lib --tests`: 265 passed.
+- `cargo check --locked --examples`: passed.
+- `cargo test --locked --doc`: 3 passed, 8 ignored upstream examples.
+- OxideTerm workspace/all-targets check passed with this checkout supplied as
+  the russh path override. SSH, SFTP, and forwarding suites passed (236 tests);
+  terminal SSH-worker tests passed (21, with the manual benchmark ignored).
+- The real OpenSSH matrix passed for RSA SHA-256 and SHA-512 with both plain
+  agent keys and RSA user certificates; each case verified shell command output.
+- Formatting and diff checks passed. Windows/Linux native execution and Nix
+  builds were not run on this host.
+
+The SFTP transport microbenchmark used the same release profile, 1 s warm-up,
+2 s measurement and 20 samples before and after the upgrade. Values below are
+median per-transfer times; this benchmark measures in-memory queue/window
+handoff, not encrypted network throughput.
+
+| Path / payload | 0.63.0 | 0.65.0 |
+| --- | ---: | ---: |
+| Borrowed / 32 KiB | 591.30 ns | 585.53 ns |
+| Borrowed / 128 KiB | 1908.84 ns | 1909.94 ns |
+| Borrowed / 256 KiB | 3522.31 ns | 3575.90 ns |
+| Owned / 32 KiB | 106.74 ns | 107.92 ns |
+| Owned / 128 KiB | 106.62 ns | 108.39 ns |
+| Owned / 256 KiB | 105.77 ns | 107.10 ns |
+
+Owned handoff increased by about 1–2 ns. Criterion classified the 128/256 KiB
+owned cases as small regressions; the additive send-window fix is retained for
+correct credit accounting. Borrowed cases had no statistically significant
+change. An initial post-upgrade run overlapped terminal regression work; the
+table uses the subsequent isolated run.
+
+### Commands
+
 After changing this fork, run the relevant russh tests here:
 
 ```sh
@@ -317,23 +376,17 @@ cargo test -p russh channel_tx_write_bytes_preserves_owned_slices
 cargo bench -p russh --features _bench --bench sftp_transport
 ```
 
-The RSA SHA-2 wire regression harness remains in the historical Tauri
-repository because those tests launch real local OpenSSH servers. That
-repository is pinned to its own vendored russh 0.61.2, so running it unchanged
-does not validate this tree. Before using the harness, make a disposable copy
-or worktree, point its russh dependency at this vendor directory, and confirm
-the resolved path with `cargo tree`. Then run it when changing certificate
-algorithm names, signer packet construction, or RSA agent behavior:
+The current OxideTerm fixture exercises the production authentication adapter
+against local OpenSSH, with an isolated agent socket and synthetic RSA keys.
+Run it when changing certificate algorithm names, signer packet construction,
+or RSA agent behavior:
 
 ```sh
-cd /Users/dominical/Documents/oxideterm-main/src-tauri
-cargo test rsa_sha2 -- --test-threads=1
+cd ../OxideTerm
+cargo test -p oxideterm-ssh --test upstream_proxy_e2e local_sshd_rsa_sha2_agent_and_certificate_matrix -- --ignored --test-threads=1
 ```
 
-Never report the historical harness as validation of the current fork unless
-its resolved russh dependency points at this directory.
-
-The expected coverage is four real local OpenSSH tests:
+The matrix verifies command output after authentication in four cases:
 
 - agent auth against an `rsa-sha2-256`-only server
 - agent auth against an `rsa-sha2-512`-only server
@@ -348,7 +401,7 @@ actual SSH wire algorithm name and signature packet shape.
 When updating russh:
 
 1. Diff the current tree against upstream commit
-   `dbe2234491fcd50e0bf68438452932f918092fe0` and its exact crates.io package.
+   `183a22e8f8f490fa09b6eb7bd044ef99d8c4414f` and its exact crates.io package.
 2. Import the proposed release as a clean baseline and update
    `.cargo_vcs_info.json`; do not replay raw hunks before checking for upstream
    equivalents.

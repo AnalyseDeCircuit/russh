@@ -83,6 +83,11 @@ impl ServerKex {
         }
     }
 
+    /// `Created` is "our KEXINIT is out, the peer's has not arrived".
+    pub fn peer_kexinit_received(&self) -> bool {
+        !matches!(self.state, ServerKexState::Created)
+    }
+
     pub fn strict_kex(&self) -> bool {
         match self.state {
             ServerKexState::Created => false,
@@ -156,6 +161,7 @@ impl ServerKex {
 
                     return Ok(KexProgress::Done {
                         server_host_certificate: None,
+                        agent_session_binding: None,
                         newkeys,
                         server_host_key: None,
                     });
@@ -392,6 +398,7 @@ impl ServerKex {
                 debug!("new keys received");
                 Ok(KexProgress::Done {
                     server_host_certificate: None,
+                    agent_session_binding: None,
                     newkeys,
                     server_host_key: None,
                 })

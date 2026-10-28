@@ -214,7 +214,7 @@ impl russh::server::Handler for Server {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &ssh_key::PublicKey,
+        _: server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
@@ -297,7 +297,7 @@ impl russh::server::Handler for HandleBackpressureServer {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &ssh_key::PublicKey,
+        _: server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
