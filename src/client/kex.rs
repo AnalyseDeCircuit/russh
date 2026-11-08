@@ -332,9 +332,7 @@ impl ClientKex {
                 })?;
 
                 let signature_blob = Bytes::decode(r)?;
-                let mut signature_reader = &signature_blob[..];
-                let signature = Signature::decode(&mut signature_reader)?;
-                ensure_end(&signature_reader)?;
+                let signature = decode_server_signature(&signature_blob)?;
                 ensure_end(r)?;
 
                 if let Err(e) =
@@ -410,6 +408,114 @@ impl ClientKex {
                 })
             }
         }
+    }
+}
+
+fn decode_server_signature(blob: &[u8]) -> Result<Signature, Error> {
+    let mut reader = blob;
+    let algorithm = ssh_key::Algorithm::decode(&mut reader)?;
+    if !matches!(algorithm, ssh_key::Algorithm::Ecdsa { .. }) {
+        let mut reader = blob;
+        let signature = Signature::decode(&mut reader)?;
+        ensure_end(&reader)?;
+        return Ok(signature);
+    }
+
+    // Older Huawei VRP peers pad ECDSA scalars with redundant zero bytes.
+    // Normalize only these wire integers, never the host key or exchange
+    // transcript. Signature::new still enforces curve sizes, and the caller
+    // verifies the resulting signature against the original exchange hash.
+    let data = Bytes::decode(&mut reader)?;
+    ensure_end(&reader)?;
+    let mut reader = data.as_ref();
+    let mut normalized = Vec::new();
+    for _ in 0..2 {
+        let scalar = Bytes::decode(&mut reader)?;
+        if scalar.first().is_some_and(|byte| byte & 0x80 != 0) {
+            return Err(ssh_key::Error::FormatEncoding.into());
+        }
+        Mpint::from_positive_bytes(&scalar).encode(&mut normalized)?;
+    }
+    ensure_end(&reader)?;
+    Ok(Signature::new(algorithm, normalized)?)
+}
+
+#[cfg(test)]
+mod server_signature_tests {
+    use super::*;
+    use hex_literal::hex;
+    use signature::{Signer, Verifier};
+    use ssh_key::{Algorithm, EcdsaCurve, PrivateKey};
+
+    fn wire_signature(r: &[u8], s: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        r.encode(&mut data).unwrap();
+        s.encode(&mut data).unwrap();
+        let mut blob = Vec::new();
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        }
+        .encode(&mut blob)
+        .unwrap();
+        data.encode(&mut blob).unwrap();
+        blob
+    }
+
+    #[test]
+    fn captured_huawei_ecdsa_signature_decodes_to_the_same_scalars() {
+        let r = hex!("003b14e93b3c004e5ed3ed20ea784e324e3412544b3e70067610a75400a1b58551");
+        let s = hex!("0000dae41a520e9c1843d1302626f0c38c8a7b979e4510da0e9ff4331718aa8b2985");
+        let signature = decode_server_signature(&wire_signature(&r, &s)).unwrap();
+        let expected = wire_signature(&r[1..], &s[1..]);
+        assert_eq!(
+            signature,
+            Signature::decode(&mut expected.as_slice()).unwrap()
+        );
+    }
+
+    #[test]
+    fn padded_signature_still_requires_a_valid_signature_for_the_exchange() {
+        let key = PrivateKey::random(
+            &mut rand::rng(),
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+        )
+        .unwrap();
+        let message = b"synthetic SSH exchange hash";
+        let signature: Signature = key.try_sign(message).unwrap();
+        let mut data = signature.as_bytes();
+        let mut r = vec![0, 0];
+        r.extend(Vec::<u8>::decode(&mut data).unwrap());
+        let mut s = vec![0, 0];
+        s.extend(Vec::<u8>::decode(&mut data).unwrap());
+        let signature = decode_server_signature(&wire_signature(&r, &s)).unwrap();
+        Verifier::verify(key.public_key(), message, &signature).unwrap();
+        assert!(
+            Verifier::verify(key.public_key(), b"different exchange hash", &signature).is_err()
+        );
+    }
+
+    #[test]
+    fn negative_oversized_and_trailing_signature_data_are_rejected() {
+        for (r, s) in [(vec![0x80], vec![1]), (vec![1; 33], vec![1])] {
+            assert!(decode_server_signature(&wire_signature(&r, &s)).is_err());
+        }
+        let mut blob = wire_signature(&[1], &[1]);
+        blob.push(0);
+        assert!(decode_server_signature(&blob).is_err());
+        let mut data = Vec::new();
+        [1u8].as_slice().encode(&mut data).unwrap();
+        [1u8].as_slice().encode(&mut data).unwrap();
+        data.push(0);
+        let mut blob = Vec::new();
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        }
+        .encode(&mut blob)
+        .unwrap();
+        data.encode(&mut blob).unwrap();
+        assert!(decode_server_signature(&blob).is_err());
     }
 }
 
